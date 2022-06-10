@@ -11,6 +11,12 @@ async def echo(websocket):
     print("conversation id: %s" % conv_id)
 
     conv_clients = clients.setdefault(conv_id, [])
+
+    # means there would be three clients, which doesn't make sense
+    if len(conv_clients) > 1:
+        websocket.close()
+        return
+
     conv_clients.append(websocket)
     print("conversation has %d members" % len(conv_clients))
 
