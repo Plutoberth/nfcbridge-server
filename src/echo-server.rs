@@ -11,69 +11,125 @@
 //! Type a message into the client window, press enter to send it and
 //! see it echoed back.
 
-use std::{env, io::Error};
+use std::{collections::HashMap, env, io::Error, sync::Arc};
 
 use futures_util::{future, StreamExt, TryStreamExt};
-use log::info;
 use tokio::net::{TcpListener, TcpStream};
-    use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+    use tokio_tungstenite::{tungstenite::{handshake::server::{Request, Response}, protocol::frame::{coding::CloseCode, CloseFrame}}, WebSocketStream};
 
+
+type RoomHashmap = HashMap<String, WebSocketStream<TcpStream>>;
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    let _ = env_logger::try_init();
+    let rooms: RoomHashmap = HashMap::new();
+    let room_shared = std::sync::Arc::new(tokio::sync::Mutex::new(rooms));
+
     let addr = env::args().nth(1).unwrap_or_else(|| "127.0.0.1:8080".to_string());
 
     // Create the event loop and TCP listener we'll accept connections on.
     let try_socket = TcpListener::bind(&addr).await;
     let listener = try_socket.expect("Failed to bind");
-    info!("Listening on: {}", addr);
+    println!("Listening on: {}", addr);
 
     while let Ok((stream, _)) = listener.accept().await {
-        tokio::spawn(accept_connection(stream));
+        tokio::spawn(accept_connection(stream, room_shared.clone()));
     }
 
     Ok(())
 }
 
-async fn accept_connection(stream: TcpStream) {
+async fn accept_connection(stream: TcpStream, rooms: Arc<tokio::sync::Mutex<RoomHashmap>>) {
     let addr = stream.peer_addr().expect("connected streams should have a peer address");
-    info!("Peer address: {}", addr);
+    println!("Peer address: {}", addr);
 
 
-    let mut query_string: Option<String> = None;
+    let mut is_host: bool = false;    
+    let mut room_name: Option<String> = None;
 
     let ws_stream = tokio_tungstenite::accept_hdr_async(stream,  |req: &Request, response: Response| {
         // accept a path like /room/<name>
         let path = req.uri().path();
-        if path.starts_with("/room/") {
-            query_string = path.strip_prefix("/room/").map(|s| s.to_string());
-            return Ok(response);
+        if !(path.starts_with("/host/") || path.starts_with("/join/") ) {
+            // invalid path - reject the handshake with a 400 response
+            let response = Response::builder()
+                .status(400)
+                .body(Some("Invalid path - can be either /host/<name> or /join/<name>".into())).unwrap();
+            return Err(response);
+        } 
+
+        if path.starts_with("/host/") {
+            is_host = true;
         } else {
-            panic!("Path must start with /room/");
-            // // invalid path
-            // let response = Response::builder()
-            //     .status(400)
-            //     .body(Some("Invalid path".into()))
-            //     .unwrap();
-            // return Ok(response);
+            is_host = false;
         }
+        room_name = path.strip_prefix(if is_host { "/host/" } else { "/join/" }).map(|s| s.to_string());
+
+        // Ensure that room name is alphanumeric or hyphens/underscores
+        if let Some(ref name) = room_name {
+            if !name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+                let response = Response::builder()
+                    .status(400)
+                    .body(Some("Invalid room name - only alphanumeric, hyphens and underscores allowed".into())).unwrap();
+                return Err(response);
+            }
+        } else {
+            let response = Response::builder()
+                .status(400)
+                .body(Some("Room name missing".into())).unwrap();
+            return Err(response);
+        }
+
+        return Ok(response);
     })
-    .await
-    .expect("Error during the websocket handshake occurred");
+    .await;
+
+    let room_name = room_name.expect("Room name should be set here");
+
+    let mut ws_stream = match ws_stream {
+        Ok(ws) => ws,
+        Err(e) => {
+            println!("Handshake rejected or failed: {}", e);
+            return; // stop handling this connection, keep server running
+        }
+    };
     
-    //let room_name = room_holder.lock().ok().and_then(|g| g.clone());
-    
-    if let Some(r) = query_string {
-        println!("New WebSocket connection: {} (room={})", addr, r);
-    } else {
-        println!("New WebSocket connection: {}", addr);
+    if is_host {
+        if rooms.lock().await.contains_key(&room_name) {
+            println!("Room already exists: {}", room_name);
+            // Close stream with indicative error to the host
+            ws_stream.close(Some(CloseFrame {
+                code: CloseCode::Error,
+                reason: "Room already exists".into(),
+            })).await.expect("Failed to close connection");
+            return;
+        }
+        
+        rooms.lock().await.insert(room_name.clone(), ws_stream);
+        println!("Room created, waiting for a client to join...");  
+        return;
     }
 
-    let (write, read) = ws_stream.split();
-    // We should not forward messages other than text or binary.
-    read.try_filter(|msg| future::ready(msg.is_text() || msg.is_binary()))
-        .forward(write)
-        .await
-        .expect("Failed to forward messages")
+    // Client flow
+    let Some(host) = rooms.lock().await.remove(&room_name) else {
+        println!("No such room: {}", room_name);
+        // Close stream with indicative error to the client
+        ws_stream.close(Some(CloseFrame {
+            code: CloseCode::Error,
+            reason: "No such room".into(),
+        })).await.expect("Failed to close connection");
+        return;
+    };
+
+    let (host_write, host_read) = host.split();
+    let (client_write, client_read) = ws_stream.split();
+
+    let from_host_to_client = host_read.try_filter(|msg| future::ready(msg.is_text() || msg.is_binary()))
+        .forward(client_write);
+    let from_client_to_host = client_read.try_filter(|msg| future::ready(msg.is_text() || msg.is_binary()))
+        .forward(host_write);
+
+    // TODO: Close other connection gracefully when one side disconnects
+    future::select(from_host_to_client, from_client_to_host).await;
+    println!("Room {} closed", room_name);
 }
