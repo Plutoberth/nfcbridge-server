@@ -121,15 +121,18 @@ async fn accept_connection(stream: TcpStream, rooms: Arc<tokio::sync::Mutex<Room
         return;
     };
 
-    let (host_write, host_read) = host.split();
-    let (client_write, client_read) = ws_stream.split();
-
-    let from_host_to_client = host_read.try_filter(|msg| future::ready(msg.is_text() || msg.is_binary()))
-        .forward(client_write);
-    let from_client_to_host = client_read.try_filter(|msg| future::ready(msg.is_text() || msg.is_binary()))
-        .forward(host_write);
-
-    // TODO: Close other connection gracefully when one side disconnects
-    future::select(from_host_to_client, from_client_to_host).await;
+    bend_pipe(host, ws_stream).await;
     println!("Room {} closed", room_name);
+}
+
+async fn bend_pipe(side1: WebSocketStream<TcpStream>, side2: WebSocketStream<TcpStream>) {
+    let (side1_write, side1_read) = side1.split();
+    let (side2_write, side2_read) = side2.split();
+
+    let side1_to_side2 = side1_read.try_filter(|msg| future::ready(msg.is_text() || msg.is_binary()))
+        .forward(side2_write);
+    let side2_to_side1 = side2_read.try_filter(|msg| future::ready(msg.is_text() || msg.is_binary()))
+        .forward(side1_write);
+
+    future::select(side1_to_side2, side2_to_side1).await;
 }
