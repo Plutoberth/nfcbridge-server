@@ -13,7 +13,7 @@
 
 use std::{collections::HashMap, env, io::Error, sync::Arc};
 
-use futures_util::{future, StreamExt, TryStreamExt};
+use futures_util::{future, SinkExt, StreamExt, TryStreamExt};
 use tokio::net::{TcpListener, TcpStream};
     use tokio_tungstenite::{tungstenite::{handshake::server::{ErrorResponse, Request, Response}}, WebSocketStream};
     use url::Url;
@@ -67,8 +67,10 @@ async fn accept_connection(stream: TcpStream, rooms: Arc<std::sync::Mutex<RoomHa
             rooms.lock().unwrap().insert(host.room_name, Room { host: ws_stream, password: host.password });
             return; // stop handling this connection, keep server running
         },
-        Some(Client::Client(client)) => {
+        Some(Client::Client(mut client)) => {
             println!("Creating room {}", client.room_name);
+            // Flush host
+            client.room.host.flush().await.ok();
             bend_pipe(client.room.host, ws_stream).await;
             println!("Room {} closed", client.room_name);
             return; // stop handling this connection, keep server running
