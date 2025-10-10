@@ -15,7 +15,7 @@ use std::{collections::HashMap, env, io::Error, sync::Arc};
 
 use futures_util::{future, StreamExt, TryStreamExt};
 use tokio::net::{TcpListener, TcpStream};
-    use tokio_tungstenite::{tungstenite::{handshake::server::{ErrorResponse, Request, Response}, protocol::frame::{coding::CloseCode, CloseFrame}}, WebSocketStream};
+    use tokio_tungstenite::{tungstenite::{handshake::server::{ErrorResponse, Request, Response}}, WebSocketStream};
     use url::Url;
 
 
@@ -29,7 +29,7 @@ type RoomHashmap = HashMap<String, Room>;
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     let rooms: RoomHashmap = HashMap::new();
-    let room_shared = std::sync::Arc::new(tokio::sync::Mutex::new(rooms));
+    let room_shared = std::sync::Arc::new(std::sync::Mutex::new(rooms));
 
     let addr = env::args().nth(1).unwrap_or_else(|| "127.0.0.1:8080".to_string());
 
@@ -45,74 +45,62 @@ async fn main() -> Result<(), Error> {
     Ok(())
 }
 
-async fn accept_connection(stream: TcpStream, rooms: Arc<tokio::sync::Mutex<RoomHashmap>>) {
+async fn accept_connection(stream: TcpStream, rooms: Arc<std::sync::Mutex<RoomHashmap>>) {
     let addr = stream.peer_addr().expect("connected streams should have a peer address");
     println!("Peer address: {}", addr);
 
-    let mut state = CallbackState::default();
-    let cb = create_connection_hdr_callback(&mut state);
+    let mut state = CallbackState { client: None };
+    let cb = create_connection_hdr_callback(&mut state, &rooms);
     let ws_stream = tokio_tungstenite::accept_hdr_async(stream,  cb).await;
     
-        let mut ws_stream = match ws_stream {
-            Ok(ws) => ws,
-            Err(e) => {
-                println!("Handshake rejected or failed: {}", e);
-                return; // stop handling this connection, keep server running
-            }
-        };
-
-    let room_name = state.room_name.expect("Room name should be set here");
-    if state.is_host {
-        if rooms.lock().await.contains_key(&room_name) {
-            println!("Room already exists: {}", room_name);
-            // Close stream with indicative error to the host
-            ws_stream.close(Some(CloseFrame {
-                code: CloseCode::Error,
-                reason: "Room already exists".into(),
-            })).await.expect("Failed to close connection");
-            return;
+    let ws_stream = match ws_stream {
+        Ok(ws) => ws,
+        Err(e) => {
+            println!("Handshake rejected or failed: {}", e);
+            return; // stop handling this connection, keep server running
         }
-
-        rooms.lock().await.insert(room_name.clone(), Room { host: ws_stream, password: state.password.unwrap() });
-        println!("Room created, waiting for a client to join...");
-        return;
-    }
-
-
-    let Some(host) = rooms.lock().await.remove(&room_name) else {
-        println!("No such room: {}", room_name);
-        // Close stream with indicative error to the client
-        ws_stream.close(Some(CloseFrame {
-            code: CloseCode::Error,
-            reason: "No such room".into(),
-        })).await.expect("Failed to close connection");
-        return;
     };
 
-    if host.password != state.password.unwrap() {
-        println!("Invalid password for room: {}", room_name);
-        // Close stream with indicative error to the client
-        ws_stream.close(Some(CloseFrame {
-            code: CloseCode::Error,
-            reason: "Invalid password".into(),
-        })).await.expect("Failed to close connection");
-        // Reinsert the host back into the rooms list
-        rooms.lock().await.insert(room_name.clone(), host);
-        return;
+    match state.client {
+        Some(Client::Host(host)) => {
+            println!("Room hosted, waiting for a client to join...");
+            rooms.lock().unwrap().insert(host.room_name, Room { host: ws_stream, password: host.password });
+            return; // stop handling this connection, keep server running
+        },
+        Some(Client::Client(client)) => {
+            println!("Creating room {}", client.room_name);
+            bend_pipe(client.room.host, ws_stream).await;
+            println!("Room {} closed", client.room_name);
+            return; // stop handling this connection, keep server running
+        },
+        None => {
+            println!("No client state after handshake - this should not happen");
+            return; // stop handling this connection, keep server running
+        }
     }
 
-    bend_pipe(host.host, ws_stream).await;
-    println!("Room {} closed", room_name);
 }
 
-#[derive(Default)]
+struct RoomHost {
+    room_name: String,
+    password: String,
+}
+
+struct RoomClient {
+    room_name: String,
+    room: Room,
+}
+
+enum Client {
+    Host(RoomHost),
+    Client(RoomClient),
+}
+
 struct CallbackState {
-    is_host: bool,
-    room_name: Option<String>,
-    password: Option<String>,
+    client: Option<Client>,
 }
 
-fn create_connection_hdr_callback(state: &mut CallbackState) -> impl FnMut(&Request, Response) -> Result<Response, ErrorResponse> {
+fn create_connection_hdr_callback(state: &mut CallbackState, rooms: &Arc<std::sync::Mutex<RoomHashmap>>) -> impl FnMut(&Request, Response) -> Result<Response, ErrorResponse> {
     move |req: &Request, response: Response| {
         // Hack to let url parse work
         let full_url = format!("http://ws.com{}", req.uri());
@@ -125,47 +113,78 @@ fn create_connection_hdr_callback(state: &mut CallbackState) -> impl FnMut(&Requ
             return Err(response);
         };
         
-        // Match "host" or "join" path with match statement
-        match url_parsed.path() {
-            "/host" => state.is_host = true,
-            "/join" => state.is_host = false,
+        let is_host = match url_parsed.path() {
+            "/host" => true,
+            "/join" => false,
             _ => {
                 let response = Response::builder()
                     .status(400)
                     .body(Some("Invalid path - can be either /host or /join".into())).unwrap();
                 return Err(response);
             }
-        }
+        };
 
-        state.room_name = url_parsed.query_pairs().find(|(k, _)| k == "room").map(|(_, v)| v.to_string());
-
-        if state.room_name.is_none() {
+        let room_name = url_parsed.query_pairs().find(|(k, _)| k == "room").map(|(_, v)| v.to_string());
+        let Some(room_name) = room_name else {
             let response = Response::builder()
                 .status(400)
                 .body(Some("Missing room name".into())).unwrap();
             return Err(response);
-        }
+        };
 
-        state.password = url_parsed.query_pairs().find(|(k, _)| k == "password").map(|(_, v)| v.to_string());
-
-        if state.password.is_none() {
+        let password = url_parsed.query_pairs().find(|(k, _)| k == "password").map(|(_, v)| v.to_string());
+        let Some(password) = password else {
             let response = Response::builder()
                 .status(400)
                 .body(Some("Missing password".into())).unwrap();
             return Err(response);
-        }
+        };
 
         // Ensure that room name and password are alphanumeric or hyphens/underscores
         fn validate_val(val: &str) -> bool {
-            val.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') && val.len() > 2
+            val.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') && val.len() > 0
         }
 
-        if !validate_val(state.password.as_ref().unwrap()) || !validate_val(state.room_name.as_ref().unwrap()) {
+        if !validate_val(&password) || !validate_val(&room_name) {
             let response = Response::builder()
                 .status(400)
-                .body(Some("Invalid room name or password - only alphanumeric, hyphens and underscores allowed, and must be longer than 2 characters".into())).unwrap();
+                .body(Some("Invalid room name or password - only alphanumeric, hyphens and underscores allowed".into())).unwrap();
             return Err(response);
         }
+
+
+        if is_host {
+            let rooms = rooms.lock().unwrap();
+            if rooms.contains_key(&room_name) {
+                println!("Room already exists: {}", room_name);
+                // Close stream with indicative error to the host
+                
+                let response = Response::builder()
+                    .status(400)
+                    .body(Some("Room already exists".into())).unwrap();
+                return Err(response);
+            }
+            state.client = Some(Client::Host(RoomHost { room_name: room_name.clone(), password: password.clone() }));
+            println!("Room created, waiting for a client to join...");
+        } else {
+            let Some(host) = rooms.lock().unwrap().remove(&room_name) else {
+                let response = Response::builder()
+                    .status(400)
+                    .body(Some("No such room".into())).unwrap();
+                return Err(response);
+            };
+
+            if host.password != password {
+                let response = Response::builder()
+                    .status(400)
+                    .body(Some("Invalid password".into())).unwrap();
+                // Reinsert the host back into the rooms list
+                rooms.lock().unwrap().insert(room_name.clone(), host);
+                return Err(response);
+            }
+            state.client = Some(Client::Client(RoomClient { room_name: room_name.clone(), room: host }));
+        }
+
 
         return Ok(response);
     }
