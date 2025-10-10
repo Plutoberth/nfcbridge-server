@@ -10,7 +10,7 @@
 //!
 //! You can use this example together with the `server` example.
 
-use std::env;
+use std::{env, error::Error};
 
 use futures_util::{future, pin_mut, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -24,7 +24,14 @@ async fn main() {
     let (stdin_tx, stdin_rx) = futures_channel::mpsc::unbounded();
     tokio::spawn(read_stdin(stdin_tx));
 
-    let (ws_stream, _) = connect_async(&url).await.expect("Failed to connect");
+    // Print content of Http response message
+    let res = connect_async(&url).await;
+
+    let Ok((ws_stream, _)) = res else {
+        eprintln!("Error during connection to {}: {}", url, res.unwrap_err());
+        return;
+    };
+
     println!("WebSocket handshake has been successfully completed");
 
     let (write, read) = ws_stream.split();
