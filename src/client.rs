@@ -99,6 +99,7 @@ async fn main() {
                     if let Ok(s) = String::from_utf8(payload.to_vec()) {
                         let mut guard = outstanding.lock().await;
                         if let Some(sent) = guard.remove(&s) {
+                            guard.clear();
                             let rtt = Instant::now().duration_since(sent);
                             println!("Ping RTT: {} ms", rtt.as_millis());
                         }
