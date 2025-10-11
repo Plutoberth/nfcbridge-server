@@ -43,10 +43,18 @@ async fn main() {
                 // create payload as current millis since unix epoch in decimal ASCII
                 let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap();
                 let payload_str = format!("{}", now.as_millis());
-                let payload_for_send = payload_str.clone();
-                let _ = out_tx.unbounded_send(Message::Ping(payload_for_send.clone().into()));
+                // Only send if there is no outstanding ping
                 let mut guard = outstanding.lock().await;
-                guard.insert(payload_str.clone(), Instant::now());
+                if guard.is_empty() {
+                    // prepare binary message: [1] + payload bytes
+                    let mut buf = Vec::with_capacity(1 + payload_str.len());
+                    buf.push(0x01u8);
+                    buf.extend_from_slice(payload_str.as_bytes());
+                    // record before sending
+                    guard.insert(payload_str.clone(), Instant::now());
+                    drop(guard);
+                    let _ = out_tx.unbounded_send(Message::Binary(buf.into()));
+                }
             }
         });
     }
@@ -87,22 +95,26 @@ async fn main() {
                     tokio::io::stdout().write_all(txt.as_bytes()).await.unwrap();
                 }
                 Message::Binary(data) => {
-                    // Chat binary - print raw data
-                    tokio::io::stdout().write_all(&data).await.unwrap();
-                }
-                Message::Ping(payload) => {
-                    // reply with Pong carrying same payload; do not print payload
-                    let _ = out_tx.unbounded_send(Message::Pong(payload));
-                }
-                Message::Pong(payload) => {
-                    // If this matches an outstanding ping payload, compute RTT
-                    if let Ok(s) = String::from_utf8(payload.to_vec()) {
-                        let mut guard = outstanding.lock().await;
-                        if let Some(sent) = guard.remove(&s) {
-                            guard.clear();
-                            let rtt = Instant::now().duration_since(sent);
-                            println!("Ping RTT: {} ms", rtt.as_millis());
+                    if data.len() > 0 && data[0] == 0x01 {
+                        // application-level ping: reply with pong (0x02 + payload)
+                        let payload = &data[1..];
+                        let mut resp = Vec::with_capacity(1 + payload.len());
+                        resp.push(0x02u8);
+                        resp.extend_from_slice(payload);
+                        // do not print payload
+                        let _ = out_tx.unbounded_send(Message::Binary(resp.into()));
+                    } else if data.len() > 0 && data[0] == 0x02 {
+                        // application-level pong: payload is data[1..]
+                        if let Ok(s) = String::from_utf8(data[1..].to_vec()) {
+                            let mut guard = outstanding.lock().await;
+                            if let Some(sent) = guard.remove(&s) {
+                                let rtt = Instant::now().duration_since(sent);
+                                println!("Ping RTT: {} ms", rtt.as_millis());
+                            }
                         }
+                    } else {
+                        // Chat binary - print raw data
+                        tokio::io::stdout().write_all(&data).await.unwrap();
                     }
                 }
                 Message::Close(_) => {
