@@ -10,7 +10,7 @@
 //!
 //! You can use this example together with the `server` example.
 
-use std::{env, error::Error, time::Instant};
+use std::{env, time::Instant};
 
 use futures_util::{future, pin_mut, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -91,8 +91,7 @@ async fn main() {
 
             match message {
                 Message::Text(txt) => {
-                    // Chat text - print to stdout
-                    tokio::io::stdout().write_all(txt.as_bytes()).await.unwrap();
+                    println!("{}", txt);
                 }
                 Message::Binary(data) => {
                     if data.len() > 0 && data[0] == 0x01 {
@@ -113,8 +112,7 @@ async fn main() {
                             }
                         }
                     } else {
-                        // Chat binary - print raw data
-                        tokio::io::stdout().write_all(&data).await.unwrap();
+                        println!("Unrecognized binary message of length {}", data.len());
                     }
                 }
                 Message::Close(_) => {
@@ -140,6 +138,9 @@ async fn read_stdin(tx: futures_channel::mpsc::UnboundedSender<Message>) {
             Ok(n) => n,
         };
         buf.truncate(n);
-        tx.unbounded_send(Message::binary(buf)).unwrap();
+        // Convert to UTF8
+        if let Ok(txt) = String::from_utf8(buf) {
+            tx.unbounded_send(Message::Text(txt.into())).unwrap();
+        }
     }
 }
